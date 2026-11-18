@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Temporary Elevated Access Management (TEAM) Application stack with delegated admin and CMK fixes (based on upstream v1.5.2)"
+
+Parameters:
+  Login:
+    Type: String
+    Description: IAM IDC Login URL
+  CloudTrailAuditLogs:
+    Type: "String"
+    AllowedPattern: "(read_write|read|write|none|arn.*)"
+    Default: "none"
+    Description: "CloudTrail Lake EventDataStore config. Values: read, write, read_write, none, or an existing EDS ARN. Use none if CloudTrail Lake is unavailable."
+  teamAdminGroup:
+    Type: String
+    Description: TEAM application Admin group
+  teamAuditGroup:
+    Type: String
+    Description: TEAM application Auditor group
+  tags:
+    Type: String
+    Description: TEAM application tags
+    Default: ""
+  teamAccount:
+    Type: String
+    Description: TEAM deployment account ID
+  customAmplifyDomain:
+    Type: String
+    Description: Custom domain for the TEAM application
+    Default: ""
+  customRepository:
+    Type: String
+    Description: Use a custom repository for the TEAM application?
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Default: 'No'
+  customRepositorySecretName:
+    Type: String
+    Description: "Secrets Manager secret name. Must contain JSON keys AccessToken and url. Use Classic GitHub token with repo and admin:repo_hook scopes."
+    Default: ''
+  cacheTTL:
+    Type: Number
+    Description: Cache TTL in seconds for OU accounts cache
+    Default: 604800
+  IdCKmsKeyArn:
+    Type: String
+    Description: "ARN of the Customer Managed KMS key used by IAM Identity Center. Required for cross-account CMK. Leave blank if using AWS managed keys."
+    Default: ""
+
+Conditions:
+  IsEmptyCloudTrailAuditLogs: !Equals [!Ref CloudTrailAuditLogs, ""]
+  UseExternalRepo: !Equals [!Ref customRepository, 'Yes']
+  HasIdCKmsKey: !Not [!Equals [!Ref IdCKmsKeyArn, ""]]
+
+Resources:
+  TriggerAmplifyBuild:
+    Type: Custom::TriggerAmplifyBuild
+    Properties:
+      ServiceToken: !GetAtt 'TriggerBuildLambda.Arn'
+      appId: !GetAtt AmplifyApp.AppId
+      branchName: main
+      branch: !GetAtt AmplifyBranch.Arn
+
+  # ============================================================
+  # NEW: Managed policy for KMS Decrypt (cross-account CMK)
+  # Applied to AmplifyRole so all Amplify-created Lambda roles
+  # inherit the permission via the Amplify backend deployment.
+  # ============================================================
+  TEAMKmsDecryptPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: HasIdCKmsKey
+    Properties:
+      ManagedPolicyName: !Sub "TEAM-KMS-Decrypt-${AWS::StackName}"
+      Description: "Allows TEAM Lambda functions to decrypt data encrypted with the Identity Center Customer Managed KMS key"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowKMSDecrypt
+            Effect: Allow
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+            Resource: !Ref IdCKmsKeyArn
+
+  # ============================================================
+  # NEW: Managed policy for SSO, Identity Store, and Org access
+  # Ensures TEAM Lambdas can call SSO Admin APIs, query Identity
+  # Store, and list org accounts/OUs from a delegated admin account.
+  # ============================================================
+  TEAMSsoOrgAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "TEAM-SSO-Org-Access-${AWS::StackName}"
+      Description: "Allows TEAM Lambda functions to call SSO Admin, Identity Store, and Organizations APIs"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowSSOAdmin
+            Effect: Allow
+            Action:
+              - "sso:*"
+              - "sso-directory:*"
+            Resource: "*"
+          - Sid: AllowIdentityStore
+            Effect: Allow
+            Action:
+              - "identitystore:*"
+            Resource: "*"
+          - Sid: AllowOrganizationsRead
+            Effect: Allow
+            Action:
+              - "organizations:ListAccounts"
+              - "organizations:ListAccountsForParent"
+              - "organizations:ListOrganizationalUnitsForParent"
+              - "organizations:ListRoots"
+              - "organizations:DescribeOrganization"
+              - "organizations:DescribeAccount"
+              - "organizations:DescribeOrganizationalUnit"
+            Resource: "*"
+          - Sid: AllowAccountManagement
+            Effect: Allow
+            Action:
+              - "account:GetAlternateContact"
+            Resource: "*"
+
+  AmplifyRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W9
+            reason: "This is the main Amplify service role."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - amplify.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        # Attach the SSO/Org policy so Amplify backend builds have access
+        - !Ref TEAMSsoOrgAccessPolicy
+        - !If
+          - HasIdCKmsKey
+          - !Ref TEAMKmsDecryptPolicy
+          - !Ref "AWS::NoValue"
+
+  AmplifyApp:
+    Type: "AWS::Amplify::App"
+    Properties:
+      Name: TEAM-IDC-APP
+      Repository: !If
+        - UseExternalRepo
+        - !Sub >-
+          {{resolve:secretsmanager:${customRepositorySecretName}:SecretString:url}}
+        - !Sub https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/team-idc-app
+      AccessToken: !If
+        - UseExternalRepo
+        - !Sub >-
+          {{resolve:secretsmanager:${customRepositorySecretName}:SecretString:AccessToken}}
+        - !Ref 'AWS::NoValue'
+      Description: Temporary Elevated Access Management Application
+      CustomRules:
+        - Source: /<*>
+          Status: 404
+          Target: /index.html
+        - Source: </^[^.]+$|\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|ttf|map|json)$)([^.]+$)/>
+          Status: 200
+          Target: /index.html
+      EnvironmentVariables: 
+        - Name: AMPLIFY_DESTRUCTIVE_UPDATES
+          Value: true
+        - Name: _LIVE_UPDATES
+          Value: '[{"name":"Node.js version","pkg":"node","type":"nvm","version":"22.17"}]'
+
+      BuildSpec: |-
+        version: 1
+        backend:
+          phases:
+            preBuild:
+              commands:
+                - '# 14.0.0 Enforces SSL on S3 deployment bucket'
+                - npm i -g @aws-amplify/cli@14.0.0
+                - '# Update deployment parameters with helper script'
+                - node parameters.js
+            build:
+              commands:
+                - npm i -S graphql-ttl-transformer
+                - '# AL2023 preinstalls only python 3.8-3.11 (3.10 global); install the target runtime'
+                - pyenv install -s 3.13
+                - pyenv global 3.13
+                - python --version
+                - '# Execute Amplify CLI with the helper script'
+                - pip3 install --user pipenv==2026.7.1
+                - export PATH=$HOME/.local/bin:$PATH
+                - pipenv --version
+                - amplifyPush --simple --allow-destructive-graphql-schema-update
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: build
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      Tags:
+        - Key: Name
+          Value: TEAM
+      IAMServiceRole: !GetAtt AmplifyRole.Arn
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      BranchName: main
+      AppId: !GetAtt AmplifyApp.AppId
+      EnableAutoBuild: true
+      EnvironmentVariables: 
+        - Name: SSO_LOGIN
+          Value: !Ref Login
+        - Name: TEAM_ACCOUNT
+          Value: !Ref teamAccount
+        - Name: CLOUDTRAIL_AUDIT_LOGS
+          Value: !If
+            - IsEmptyCloudTrailAuditLogs
+            - "read_write"
+            - !Ref CloudTrailAuditLogs
+        - Name: TEAM_ADMIN_GROUP
+          Value: !Ref teamAdminGroup
+        - Name: TEAM_AUDITOR_GROUP
+          Value: !Ref teamAuditGroup
+        - Name: TAGS
+          Value: !Ref tags
+        - Name: AMPLIFY_CUSTOM_DOMAIN
+          Value: !Ref customAmplifyDomain
+        - Name: CACHE_TTL
+          Value: !Ref cacheTTL
+        - Name: _CUSTOM_IMAGE
+          Value: amplify:al2023
+      Tags:
+        - Key: Branch
+          Value: main
+  
+  TriggerBuildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.13
+      Role: !GetAtt AmplifyLambdaRole.Arn
+      Timeout: 120
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import boto3
+          import logging
+          from botocore.exceptions import ClientError
+          client = boto3.client('amplify')
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              logger.info("Received event: %s" % json.dumps(event))
+              appId = event['ResourceProperties']['appId']
+              branchName = event['ResourceProperties']['branchName']
+          
+              result = cfnresponse.SUCCESS
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      response = client.start_job(
+                          appId = appId,
+                          branchName = branchName,
+                          jobType='RELEASE'
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      pass
+              except ClientError as e:
+                  logger.error('Error: %s', e)
+                  result = cfnresponse.FAILED
+              cfnresponse.send(event, context, result, {})
+
+  AmplifyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Attach SSO/Org policy to the trigger Lambda role as well
+        - !Ref TEAMSsoOrgAccessPolicy
+        - !If
+          - HasIdCKmsKey
+          - !Ref TEAMKmsDecryptPolicy
+          - !Ref "AWS::NoValue"
+      Policies:
+        -
+          PolicyName: AmplifyLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Sid: AllowLogging
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              -
+                Sid: startBuild
+                Effect: Allow
+                Action: 
+                  - "amplify:StartJob"
+                Resource: "*"
+
+Outputs:
+  DefaultDomain:
+    Value: !GetAtt AmplifyApp.DefaultDomain
+  # --- NEW OUTPUTS ---
+  TEAMKmsDecryptPolicyArn:
+    Condition: HasIdCKmsKey
+    Value: !Ref TEAMKmsDecryptPolicy
+    Description: "ARN of the KMS Decrypt managed policy. Attach to all TEAM Lambda roles after Amplify build."
+  TEAMSsoOrgAccessPolicyArn:
+    Value: !Ref TEAMSsoOrgAccessPolicy
+    Description: "ARN of the SSO/Org access managed policy. Attach to all TEAM Lambda roles after Amplify build."
+  PostDeploymentNote:
+    Value: "After Amplify build completes, attach TEAM-SSO-Org-Access and TEAM-KMS-Decrypt policies to all roles matching teamidcapp and amplify-teamidcapp. Use post-deploy-permissions.sh script."
+    Description: "Post-deployment instructions for attaching policies to Amplify-created roles."
